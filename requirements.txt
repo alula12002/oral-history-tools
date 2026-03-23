@@ -1,0 +1,10 @@
+anthropic
+Pillow
+python-docx
+python-dotenv
+pdf2image
+tqdm
+fastapi
+uvicorn
+python-multipart
+pydantic

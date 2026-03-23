@@ -1,0 +1,13 @@
+MODEL = "claude-sonnet-4-20250514"
+MAX_IMAGE_BYTES = 5_000_000          # stay under 5,242,880 API limit
+MAX_IMAGE_DIM = 1600                 # max pixels on longest side
+JPEG_QUALITY = 75                    # starting quality for compression
+JPEG_MIN_QUALITY = 40                # minimum quality before giving up
+CHUNK_SIZE_PAGES = 10                # pages per refinement chunk
+MAX_TOKENS_OCR = 4096
+MAX_TOKENS_REFINE = 4096
+API_DELAY_SECONDS = 1.0              # delay between API calls (rate limit safety)
+INPUT_DIR = "input"
+OUTPUT_DIR = "output"
+RAW_DIR = "output/raw"
+REFINED_DIR = "output/refined"

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+output/
+input/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.claude/memory/
+node_modules/
+.next/
