@@ -69,7 +69,7 @@ export async function triggerExport(jobId: string): Promise<ExportResponse> {
   return res.json();
 }
 
-export function getDownloadUrl(jobId: string, format: "txt" | "docx"): string {
+export function getDownloadUrl(jobId: string, format: "txt" | "docx" | "raw"): string {
   return `${API_URL}/api/download/${jobId}/${format}`;
 }
 

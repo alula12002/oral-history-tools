@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from backend.jobs import job_store
+from backend.jobs import cleanup_old_cache, job_store, restore_cached_jobs, save_job_cache
 from backend.schemas import (
     FileInfo,
     JobStatus,
@@ -46,7 +46,18 @@ app.add_middleware(
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "oral-history-uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# In-memory storage for intermediate pipeline data (page results with full text)
+_raw_results: dict[str, list[dict]] = {}
+
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".pdf"}
+
+
+@app.on_event("startup")
+def startup_restore_cache():
+    """Restore cached jobs and clean up stale entries on server start."""
+    restored_raw = restore_cached_jobs(job_store)
+    _raw_results.update(restored_raw)
+    cleanup_old_cache()
 
 
 def _get_file_type(filename: str) -> str:
@@ -135,10 +146,11 @@ async def upload_files(
 # --- Transcribe ---
 
 def _run_transcribe(job_id: str):
-    """Background thread: prepare batch and transcribe page-by-page."""
-    from config import API_DELAY_SECONDS
+    """Background thread: prepare batch and transcribe concurrently."""
+    import asyncio
+
     from ocr.scanner import prepare_batch
-    from ocr.transcriber import transcribe_page
+    from ocr.transcriber import transcribe_batch_concurrent
 
     try:
         job = job_store.get(job_id)
@@ -153,17 +165,17 @@ def _run_transcribe(job_id: str):
         total_pages = len(batch)
         job_store.update(job_id, num_pages=total_pages)
 
-        # Transcribe page by page for per-page progress
-        client = anthropic.Anthropic()
-        results = []
-        total_tokens = 0
+        # Progress callback: update job store as pages complete
+        all_results = [None] * total_pages
+        total_tokens_acc = [0]  # mutable container for closure
 
-        for i, page in enumerate(batch):
-            result = transcribe_page(page, total_pages, mode=job.mode, client=client)
-            results.append(result)
-            total_tokens += result.get("tokens_used", 0)
+        def on_page_done(completed_count, total, result):
+            # Track result by sequence number
+            idx = result["sequence"] - 1
+            all_results[idx] = result
+            total_tokens_acc[0] += result.get("tokens_used", 0)
 
-            # Update progress after each page
+            # Build page_results from all completed so far (in order)
             page_results = [
                 PageResult(
                     sequence=r["sequence"],
@@ -173,36 +185,36 @@ def _run_transcribe(job_id: str):
                     confidence=r.get("confidence"),
                     status=r.get("status"),
                 )
-                for r in results
+                for r in all_results if r is not None
             ]
             job_store.update(
                 job_id,
-                progress=(i + 1) / total_pages,
+                progress=completed_count / total,
                 page_results=page_results,
-                transcription_tokens=total_tokens,
+                transcription_tokens=total_tokens_acc[0],
             )
 
-            # Rate limit between pages
-            if i < total_pages - 1:
-                time.sleep(API_DELAY_SECONDS)
+        # Run concurrent transcription in a new event loop
+        results = asyncio.run(
+            transcribe_batch_concurrent(
+                batch,
+                mode=job.mode,
+                progress_callback=on_page_done,
+            )
+        )
 
-        ok_count = sum(1 for r in results if r.get("status") == "ok")
+        ok_count = sum(1 for r in results if r and r.get("status") == "ok")
         if ok_count == 0:
             job_store.update(job_id, status=JobStatus.failed, error="No pages were successfully transcribed")
             return
 
-        # Store raw results for refine/export steps (held in memory)
-        # We store them as a job attribute via the _raw_results dict
         _raw_results[job_id] = results
 
-        job_store.update(job_id, status=JobStatus.completed, step="transcribe", progress=1.0)
+        job = job_store.update(job_id, status=JobStatus.completed, step="transcribe", progress=1.0)
+        save_job_cache(job_id, job, raw_results=results)
 
     except Exception as e:
         job_store.update(job_id, status=JobStatus.failed, error=str(e))
-
-
-# In-memory storage for intermediate pipeline data (page results with full text)
-_raw_results: dict[str, list[dict]] = {}
 
 
 @app.post("/api/transcribe/{job_id}")
@@ -230,6 +242,13 @@ def _run_refine(job_id: str):
         job = job_store.get(job_id)
         results = _raw_results.get(job_id)
         if not results:
+            # Try loading from disk cache
+            from backend.jobs import load_job_cache
+            cached = load_job_cache(job_id)
+            if cached and cached["raw_results"]:
+                results = cached["raw_results"]
+                _raw_results[job_id] = results
+        if not results:
             job_store.update(job_id, status=JobStatus.failed, error="No transcription results found. Run transcribe first.")
             return
 
@@ -241,7 +260,7 @@ def _run_refine(job_id: str):
                     header = f"--- PAGE {r['sequence']}: {r['source_file']}, page {r['source_page']} ---"
                     parts.append(f"{header}\n{r['text']}")
             final_text = "\n\n".join(parts)
-            job_store.update(
+            job = job_store.update(
                 job_id,
                 status=JobStatus.completed,
                 step="refine",
@@ -249,6 +268,7 @@ def _run_refine(job_id: str):
                 refined_text=final_text,
                 refine_stats={"chunks": 0, "tokens_used": 0, "fallback_count": 0, "skipped": True},
             )
+            save_job_cache(job_id, job, refined_text=final_text)
             return
 
         # Chunk and refine
@@ -278,7 +298,7 @@ def _run_refine(job_id: str):
                 time.sleep(API_DELAY_SECONDS)
 
         refined_text = "\n\n".join(refined_parts)
-        job_store.update(
+        job = job_store.update(
             job_id,
             status=JobStatus.completed,
             step="refine",
@@ -290,6 +310,7 @@ def _run_refine(job_id: str):
                 "fallback_count": fallback_count,
             },
         )
+        save_job_cache(job_id, job, refined_text=refined_text)
 
     except Exception as e:
         job_store.update(job_id, status=JobStatus.failed, error=str(e))
@@ -314,7 +335,7 @@ def start_refine(job_id: str):
 
 @app.get("/api/export/{job_id}")
 def export_files(job_id: str):
-    """Generate .txt and .docx exports, return download links."""
+    """Generate .txt, .docx, and raw .txt exports, return download links."""
     from shared.exporter import export_all
 
     job = _get_job_or_404(job_id)
@@ -326,7 +347,14 @@ def export_files(job_id: str):
     export_dir = UPLOAD_DIR / job_id / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    results = _raw_results.get(job_id, [])
+    results = _raw_results.get(job_id)
+    if not results:
+        # Try loading from disk cache
+        cached = load_job_cache(job_id)
+        if cached and cached["raw_results"]:
+            results = cached["raw_results"]
+            _raw_results[job_id] = results
+    results = results or []
     ok_count = sum(1 for r in results if r.get("status") == "ok")
     source_files = len(set(r["source_file"] for r in results)) if results else 0
     ocr_tokens = job.transcription_tokens
@@ -343,16 +371,22 @@ def export_files(job_id: str):
         output_dir=str(export_dir),
         title=job.title or "Document Transcription",
         metadata=metadata,
+        raw_results=results if results else None,
     )
 
     export_paths = {"txt": paths["txt"], "docx": paths["docx"]}
+    if "raw" in paths:
+        export_paths["raw"] = paths["raw"]
     job_store.update(job_id, step="export", export_paths=export_paths)
 
-    return {
+    response = {
         "job_id": job_id,
         "txt": f"/api/download/{job_id}/txt",
         "docx": f"/api/download/{job_id}/docx",
     }
+    if "raw" in paths:
+        response["raw"] = f"/api/download/{job_id}/raw"
+    return response
 
 
 @app.get("/api/download/{job_id}/{format}")
@@ -369,6 +403,7 @@ def download_file(job_id: str, format: str):
 
     media_types = {
         "txt": "text/plain",
+        "raw": "text/plain",
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     }
 

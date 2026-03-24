@@ -1,6 +1,8 @@
 import io
 import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PIL import Image, ImageOps
@@ -8,6 +10,7 @@ from pdf2image import convert_from_path
 from pdf2image.exceptions import PDFPageCountError
 
 from config import (
+    COMPRESSION_WORKERS,
     INPUT_DIR,
     JPEG_MIN_QUALITY,
     JPEG_QUALITY,
@@ -173,18 +176,26 @@ def extract_pdf_pages(filepath, dpi=200):
         logger.error("PDF extraction failed for %s: %s", filename, e)
         return []
 
-    results = []
-    for i, page_img in enumerate(pages, start=1):
-        logger.info("  Processing page %d/%d of %s", i, len(pages), filename)
+    def _compress_page(args):
+        i, page_img = args
+        logger.info("  Compressing page %d/%d of %s", i, len(pages), filename)
         image_bytes = compress_image(page_img)
-        results.append({
+        return {
             "pdf_source": filename,
             "pdf_page": i,
             "image_bytes": image_bytes,
             "compressed_size": len(image_bytes),
-        })
+        }
 
-    logger.info("Extracted %d pages from %s", len(results), filename)
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=COMPRESSION_WORKERS) as executor:
+        results = list(executor.map(_compress_page, enumerate(pages, start=1)))
+    elapsed = time.monotonic() - t0
+
+    logger.info(
+        "Extracted %d pages from %s in %.1fs (%d workers)",
+        len(results), filename, elapsed, COMPRESSION_WORKERS,
+    )
     return results
 
 
@@ -200,19 +211,44 @@ def prepare_batch(input_dir=INPUT_DIR, sort_by="modified"):
         logger.info("No files found in %s", input_dir)
         return []
 
+    t0 = time.monotonic()
     batch = []
     sequence = 0
 
     # Track per-file stats for summary
     file_stats = []
 
+    # Separate PDFs (already parallelized internally) from standalone images
+    pdf_entries = []
+    image_entries = []
+    for entry in files:
+        if entry["type"] == "pdf":
+            pdf_entries.append(entry)
+        else:
+            image_entries.append(entry)
+
+    # Process PDFs (extract_pdf_pages handles parallel compression internally)
+    pdf_results = {}  # filepath -> list of page dicts
+    for entry in pdf_entries:
+        pdf_results[entry["filepath"]] = extract_pdf_pages(entry["filepath"])
+
+    # Compress standalone images in parallel
+    image_compressed = {}  # filepath -> image_bytes
+    if image_entries:
+        paths = [e["filepath"] for e in image_entries]
+        with ThreadPoolExecutor(max_workers=COMPRESSION_WORKERS) as executor:
+            results = list(executor.map(compress_image, paths))
+        for path, image_bytes in zip(paths, results):
+            image_compressed[path] = image_bytes
+
+    # Build batch in original file order with correct sequence numbers
     for entry in files:
         filepath = entry["filepath"]
         filename = os.path.basename(filepath)
         file_original_total = entry["size"]
 
         if entry["type"] == "pdf":
-            pages = extract_pdf_pages(filepath)
+            pages = pdf_results[filepath]
             file_compressed_total = sum(p["compressed_size"] for p in pages)
             file_stats.append({
                 "name": filename,
@@ -233,7 +269,7 @@ def prepare_batch(input_dir=INPUT_DIR, sort_by="modified"):
                 })
         else:
             sequence += 1
-            image_bytes = compress_image(filepath)
+            image_bytes = image_compressed[filepath]
             compressed_size = len(image_bytes)
             file_stats.append({
                 "name": filename,
@@ -250,6 +286,9 @@ def prepare_batch(input_dir=INPUT_DIR, sort_by="modified"):
                 "original_size": file_original_total,
                 "compressed_size": compressed_size,
             })
+
+    elapsed = time.monotonic() - t0
+    logger.info("Batch preparation completed in %.1fs", elapsed)
 
     # Print summary
     _print_summary(file_stats, batch)

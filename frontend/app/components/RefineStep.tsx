@@ -55,19 +55,26 @@ export default function RefineStep({ jobId, skipRefine, onComplete }: RefineStep
     setError("");
     try {
       await startRefinement(jobId);
-      pollingRef.current = true;
-      poll();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to start refinement");
+      // 409 = already in progress (e.g. duplicate request) — just poll
+      const msg = e instanceof Error ? e.message : "";
+      if (!msg.includes("already in progress")) {
+        setError(msg || "Failed to start refinement");
+        return;
+      }
     }
+    pollingRef.current = true;
+    poll();
   }, [jobId, poll]);
 
-  // Start automatically when mounted
+  // Start automatically when mounted (useRef prevents double-fire)
+  const initRef = useRef(false);
   useEffect(() => {
-    if (!started) {
+    if (!initRef.current) {
+      initRef.current = true;
       startRefine();
     }
-  }, [started, startRefine]);
+  }, [startRefine]);
 
   const progress = status?.progress ?? 0;
 

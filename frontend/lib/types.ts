@@ -38,4 +38,5 @@ export interface ExportResponse {
   job_id: string;
   txt: string;
   docx: string;
+  raw?: string;
 }

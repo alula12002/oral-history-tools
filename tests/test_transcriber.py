@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import anthropic
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ocr.transcriber import (
@@ -69,7 +71,7 @@ class TestTranscribePage(unittest.TestCase):
         result = transcribe_page(page, total_pages=1, client=client)
 
         self.assertEqual(result["status"], "error")
-        self.assertIn("Rate limit", result["error_message"])
+        self.assertIn("Rate limit exceeded", result["error_message"])
         self.assertEqual(result["tokens_used"], 0)
 
     def test_empty_response(self):
@@ -236,6 +238,130 @@ class TestTranscribeBatch(unittest.TestCase):
             # API should only be called for page 2 (page 1 was cached)
             self.assertEqual(mock_client.messages.create.call_count, 1)
             self.assertEqual(len(results), 2)
+
+
+class TestConcurrentTranscription(unittest.TestCase):
+    """Test async concurrent transcription."""
+
+    def test_concurrent_batch_basic(self):
+        """Concurrent batch should transcribe all pages and return results in order."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from ocr.transcriber import transcribe_batch_concurrent
+
+        mock_client_cls = AsyncMock()
+        mock_response = _mock_api_response()
+
+        # Make the async create method return our mock response
+        async def mock_create(**kwargs):
+            return mock_response
+
+        with patch("ocr.transcriber.anthropic.AsyncAnthropic") as mock_cls:
+            mock_client = MagicMock()
+            mock_client.messages.create = mock_create
+            mock_cls.return_value = mock_client
+
+            pages = [_make_page_entry(sequence=i) for i in range(1, 4)]
+            results = asyncio.run(
+                transcribe_batch_concurrent(pages, max_concurrent=2)
+            )
+
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(r["status"] == "ok" for r in results))
+            # Results should be in original order
+            self.assertEqual([r["sequence"] for r in results], [1, 2, 3])
+
+    def test_concurrent_progress_callback(self):
+        """Progress callback should fire for each completed page."""
+        import asyncio
+
+        from ocr.transcriber import transcribe_batch_concurrent
+
+        async def mock_create(**kwargs):
+            return _mock_api_response()
+
+        with patch("ocr.transcriber.anthropic.AsyncAnthropic") as mock_cls:
+            mock_client = MagicMock()
+            mock_client.messages.create = mock_create
+            mock_cls.return_value = mock_client
+
+            progress_calls = []
+
+            def on_progress(completed, total, result):
+                progress_calls.append((completed, total))
+
+            pages = [_make_page_entry(sequence=i) for i in range(1, 4)]
+            asyncio.run(
+                transcribe_batch_concurrent(
+                    pages, max_concurrent=2, progress_callback=on_progress
+                )
+            )
+
+            # Should have 3 progress calls, one per page
+            self.assertEqual(len(progress_calls), 3)
+            # All should have total=3
+            self.assertTrue(all(t == 3 for _, t in progress_calls))
+
+    def test_concurrent_rate_limit_retry(self):
+        """Should retry on RateLimitError with backoff."""
+        import asyncio
+
+        from ocr.transcriber import transcribe_page_async
+
+        call_count = 0
+
+        async def mock_create(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise anthropic.RateLimitError(
+                    message="rate limited",
+                    response=MagicMock(status_code=429, headers={}),
+                    body=None,
+                )
+            return _mock_api_response()
+
+        async def run_test():
+            mock_client = MagicMock()
+            mock_client.messages.create = mock_create
+            semaphore = asyncio.Semaphore(2)
+            page = _make_page_entry(sequence=1)
+            return await transcribe_page_async(
+                page, total_pages=1, client=mock_client, semaphore=semaphore
+            )
+
+        result = asyncio.run(run_test())
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(call_count, 2)  # First call rate-limited, second succeeded
+
+    def test_concurrent_rate_limit_exhausted(self):
+        """Should fail after max retries on persistent rate limiting."""
+        import asyncio
+
+        from ocr.transcriber import transcribe_page_async
+
+        async def mock_create(**kwargs):
+            raise anthropic.RateLimitError(
+                message="rate limited",
+                response=MagicMock(status_code=429, headers={}),
+                body=None,
+            )
+
+        async def run_test():
+            mock_client = MagicMock()
+            mock_client.messages.create = mock_create
+            semaphore = asyncio.Semaphore(2)
+            page = _make_page_entry(sequence=1)
+            return await transcribe_page_async(
+                page, total_pages=1, client=mock_client, semaphore=semaphore
+            )
+
+        result = asyncio.run(run_test())
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("retries", result["error_message"].lower())
 
 
 if __name__ == "__main__":

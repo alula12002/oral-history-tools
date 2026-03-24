@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -8,7 +9,7 @@ import time
 import anthropic
 from tqdm import tqdm
 
-from config import API_DELAY_SECONDS, MAX_TOKENS_OCR, MODEL, RAW_DIR
+from config import API_DELAY_SECONDS, MAX_CONCURRENT_TRANSCRIBE, MAX_TOKENS_OCR, MODEL, RAW_DIR
 
 logger = logging.getLogger("oral-history-tools")
 
@@ -121,6 +122,165 @@ def transcribe_page(page_entry, total_pages, mode="handwritten", client=None):
         page_entry["sequence"], total_pages, len(text), confidence, tokens,
     )
     return result
+
+
+async def transcribe_page_async(page_entry, total_pages, mode="handwritten",
+                                client=None, semaphore=None):
+    """Transcribe a single page via Claude Vision API with concurrency control and retry.
+
+    Args:
+        page_entry: Dict from prepare_batch.
+        total_pages: Total number of pages in the batch.
+        mode: "handwritten", "printed", or "mixed".
+        client: anthropic.AsyncAnthropic client.
+        semaphore: asyncio.Semaphore for concurrency limiting.
+
+    Returns:
+        Enriched page_entry dict (same structure as transcribe_page).
+    """
+    result = {
+        **{k: v for k, v in page_entry.items() if k != "image_bytes"},
+        "text": "",
+        "confidence": None,
+        "tokens_used": 0,
+        "status": "error",
+        "error_message": None,
+    }
+
+    mode_hint = MODE_HINTS.get(mode, MODE_HINTS["handwritten"])
+    b64 = base64.b64encode(page_entry["image_bytes"]).decode("utf-8")
+
+    user_text = (
+        f"{mode_hint}\n\n"
+        f"Transcribe this document page. "
+        f"Page {page_entry['sequence']} of {total_pages}. "
+        f"Source: {page_entry['source_file']}, page {page_entry['source_page']}."
+    )
+
+    max_retries = 3
+
+    async with semaphore:
+        for attempt in range(max_retries + 1):
+            try:
+                response = await client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS_OCR,
+                    system=OCR_SYSTEM_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": b64,
+                                },
+                            },
+                            {"type": "text", "text": user_text},
+                        ],
+                    }],
+                )
+                break
+            except (anthropic.RateLimitError, anthropic.APIStatusError,
+                    anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                # Retry on transient errors: rate limits, 500/529, connection, timeout
+                is_permanent = (
+                    isinstance(e, anthropic.APIStatusError)
+                    and e.status_code not in (429, 500, 502, 503, 529)
+                )
+                if is_permanent:
+                    logger.error("Non-retryable API error on page %d: %s", page_entry["sequence"], e)
+                    result["error_message"] = str(e)
+                    return result
+                if attempt < max_retries:
+                    delay = min(2 ** attempt * 2, 60)
+                    logger.warning(
+                        "Transient error on page %d (%s), backing off %ds (attempt %d/%d)",
+                        page_entry["sequence"], type(e).__name__, delay, attempt + 1, max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("Retries exhausted for page %d after %d attempts: %s",
+                                 page_entry["sequence"], max_retries, e)
+                    result["error_message"] = f"Failed after {max_retries} retries: {e}"
+                    return result
+            except Exception as e:
+                logger.error("Unexpected error on page %d: %s", page_entry["sequence"], e)
+                result["error_message"] = str(e)
+                return result
+
+    text = response.content[0].text if response.content else ""
+    tokens = response.usage.input_tokens + response.usage.output_tokens
+
+    confidence = None
+    match = re.search(r"CONFIDENCE:\s*(\d+)%", text)
+    if match:
+        confidence = match.group(1) + "%"
+
+    if not text or len(text.strip()) < 5:
+        result.update(text=text, confidence=confidence, tokens_used=tokens, status="empty")
+    else:
+        result.update(text=text, confidence=confidence, tokens_used=tokens, status="ok")
+
+    logger.info(
+        "Page %d/%d transcribed: %d chars, confidence=%s, tokens=%d",
+        page_entry["sequence"], total_pages, len(text), confidence, tokens,
+    )
+    return result
+
+
+async def transcribe_batch_concurrent(prepared_pages, mode="handwritten",
+                                      max_concurrent=None, progress_callback=None):
+    """Transcribe pages concurrently with rate-limit handling.
+
+    Args:
+        prepared_pages: List of page dicts from prepare_batch().
+        mode: "handwritten", "printed", or "mixed".
+        max_concurrent: Max concurrent API calls (default from config).
+        progress_callback: Optional callable(completed_count, total_pages, result)
+            called after each page completes.
+
+    Returns:
+        List of enriched page_entry dicts in original order.
+    """
+    max_concurrent = max_concurrent or MAX_CONCURRENT_TRANSCRIBE
+    client = anthropic.AsyncAnthropic()
+    semaphore = asyncio.Semaphore(max_concurrent)
+    total_pages = len(prepared_pages)
+
+    logger.info(
+        "Starting concurrent transcription: %d pages, max_concurrent=%d",
+        total_pages, max_concurrent,
+    )
+    t0 = time.monotonic()
+
+    results = [None] * total_pages
+    completed_count = 0
+    lock = asyncio.Lock()
+
+    async def process_page(index, page):
+        nonlocal completed_count
+        result = await transcribe_page_async(page, total_pages, mode, client, semaphore)
+        async with lock:
+            results[index] = result
+            completed_count += 1
+            if progress_callback:
+                progress_callback(completed_count, total_pages, result)
+        return result
+
+    tasks = [process_page(i, page) for i, page in enumerate(prepared_pages)]
+    await asyncio.gather(*tasks)
+
+    elapsed = time.monotonic() - t0
+    ok_count = sum(1 for r in results if r and r.get("status") == "ok")
+    total_tokens = sum(r.get("tokens_used", 0) for r in results if r)
+    logger.info(
+        "Concurrent transcription done: %d/%d ok in %.1fs, %d tokens",
+        ok_count, total_pages, elapsed, total_tokens,
+    )
+
+    return results
 
 
 def _save_checkpoint(result, output_dir):

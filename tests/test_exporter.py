@@ -7,7 +7,7 @@ from docx import Document
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from shared.exporter import export_txt, export_docx, export_all
+from shared.exporter import export_txt, export_docx, export_all, export_raw_txt
 
 
 SAMPLE_TEXT = """--- PAGE 1: notebook.pdf, page 1 ---
@@ -97,6 +97,42 @@ class TestExportDocx(unittest.TestCase):
             self.assertIn("12,345", full_text)
 
 
+class TestExportRawTxt(unittest.TestCase):
+
+    def test_creates_raw_file(self):
+        """Raw export should create a .txt file with page markers."""
+        raw_results = [
+            {"sequence": 1, "source_file": "test.pdf", "source_page": 1,
+             "text": "Page one text", "status": "ok"},
+            {"sequence": 2, "source_file": "test.pdf", "source_page": 2,
+             "text": "Page two text", "status": "ok"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = export_raw_txt(raw_results, output_dir=tmpdir, filename="raw_out")
+            self.assertTrue(os.path.exists(path))
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("--- PAGE 1:", content)
+            self.assertIn("Page one text", content)
+            self.assertIn("--- PAGE 2:", content)
+            self.assertIn("Page two text", content)
+
+    def test_skips_non_ok_pages(self):
+        """Raw export should skip pages with error/empty status."""
+        raw_results = [
+            {"sequence": 1, "source_file": "a.jpg", "source_page": 1,
+             "text": "Good page", "status": "ok"},
+            {"sequence": 2, "source_file": "b.jpg", "source_page": 1,
+             "text": "", "status": "error"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = export_raw_txt(raw_results, output_dir=tmpdir, filename="filtered")
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("Good page", content)
+            self.assertNotIn("PAGE 2", content)
+
+
 class TestExportAll(unittest.TestCase):
 
     def test_creates_both_files(self):
@@ -104,6 +140,23 @@ class TestExportAll(unittest.TestCase):
             paths = export_all(SAMPLE_TEXT, output_dir=tmpdir, filename="both")
             self.assertTrue(os.path.exists(paths["txt"]))
             self.assertTrue(os.path.exists(paths["docx"]))
+            self.assertNotIn("raw", paths)
+
+    def test_creates_all_three_with_raw(self):
+        """When raw_results provided, export_all should create raw .txt too."""
+        raw_results = [
+            {"sequence": 1, "source_file": "test.pdf", "source_page": 1,
+             "text": "Raw page text", "status": "ok"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = export_all(
+                SAMPLE_TEXT, output_dir=tmpdir, filename="all3",
+                raw_results=raw_results,
+            )
+            self.assertTrue(os.path.exists(paths["txt"]))
+            self.assertTrue(os.path.exists(paths["docx"]))
+            self.assertIn("raw", paths)
+            self.assertTrue(os.path.exists(paths["raw"]))
 
 
 if __name__ == "__main__":

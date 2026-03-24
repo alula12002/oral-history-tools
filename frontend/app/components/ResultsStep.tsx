@@ -29,7 +29,7 @@ export default function ResultsStep({ jobId, status }: ResultsStepProps) {
   }, [jobId]);
 
   const handleDownload = useCallback(
-    (format: "txt" | "docx") => {
+    (format: "txt" | "docx" | "raw") => {
       const url = getDownloadUrl(jobId, format);
       window.open(url, "_blank");
     },
@@ -157,18 +157,26 @@ export default function ResultsStep({ jobId, status }: ResultsStepProps) {
           )}
         </button>
       ) : (
-        <div className="flex gap-3">
+        <div className="space-y-2">
+          <div className="flex gap-3">
+            <button
+              onClick={() => handleDownload("txt")}
+              className="flex-1 bg-gray-800 text-white py-2 px-4 rounded font-medium hover:bg-gray-900 transition-colors"
+            >
+              Download .txt
+            </button>
+            <button
+              onClick={() => handleDownload("docx")}
+              className="flex-1 bg-blue-600 text-white py-2 px-4 rounded font-medium hover:bg-blue-700 transition-colors"
+            >
+              Download .docx
+            </button>
+          </div>
           <button
-            onClick={() => handleDownload("txt")}
-            className="flex-1 bg-gray-800 text-white py-2 px-4 rounded font-medium hover:bg-gray-900 transition-colors"
+            onClick={() => handleDownload("raw")}
+            className="w-full bg-gray-100 text-gray-700 py-2 px-4 rounded font-medium hover:bg-gray-200 border border-gray-300 transition-colors text-sm"
           >
-            Download .txt
-          </button>
-          <button
-            onClick={() => handleDownload("docx")}
-            className="flex-1 bg-blue-600 text-white py-2 px-4 rounded font-medium hover:bg-blue-700 transition-colors"
-          >
-            Download .docx
+            Download Raw Transcript (before refinement)
           </button>
         </div>
       )}

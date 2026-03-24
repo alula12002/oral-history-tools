@@ -133,11 +133,56 @@ def _add_body(doc, text):
             doc.add_paragraph(block)
 
 
-def export_all(refined_text, output_dir=None, filename=None, title=None, metadata=None):
-    """Export to both .txt and .docx. Returns dict of paths."""
+def export_raw_txt(raw_results, output_dir=None, filename=None):
+    """Export raw page-by-page transcription results to a .txt file.
+
+    Args:
+        raw_results: List of page result dicts from transcription (must have
+            sequence, source_file, source_page, text, status keys).
+        output_dir: Output directory (default: REFINED_DIR).
+        filename: Output filename without extension (default: timestamped).
+
+    Returns:
+        Path to the created file.
+    """
+    output_dir = output_dir or REFINED_DIR
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not filename:
+        filename = f"transcript_raw_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    parts = []
+    for r in raw_results:
+        if r.get("status") != "ok":
+            continue
+        header = f"--- PAGE {r['sequence']}: {r['source_file']}, page {r['source_page']} ---"
+        parts.append(f"{header}\n{r.get('text', '')}")
+
+    text = "\n\n".join(parts)
+    path = os.path.join(output_dir, f"{filename}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    logger.info("Exported raw TXT: %s (%d chars, %d pages)", path, len(text), len(parts))
+    return path
+
+
+def export_all(refined_text, output_dir=None, filename=None, title=None, metadata=None,
+               raw_results=None):
+    """Export to .txt, .docx, and optionally raw .txt. Returns dict of paths."""
     txt_path = export_txt(refined_text, output_dir, filename)
     docx_path = export_docx(refined_text, output_dir, filename, title, metadata)
-    print(f"\nExported:")
+    result = {"txt": txt_path, "docx": docx_path}
+
+    if raw_results:
+        raw_filename = f"{filename}_raw" if filename else None
+        raw_path = export_raw_txt(raw_results, output_dir, raw_filename)
+        result["raw"] = raw_path
+        print(f"\nExported:")
+        print(f"  RAW:  {raw_path}")
+    else:
+        print(f"\nExported:")
+
     print(f"  TXT:  {txt_path}")
     print(f"  DOCX: {docx_path}")
-    return {"txt": txt_path, "docx": docx_path}
+    return result
