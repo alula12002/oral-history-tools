@@ -3,13 +3,22 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import time
 
 import anthropic
 from tqdm import tqdm
 
-from config import API_DELAY_SECONDS, MAX_CONCURRENT_TRANSCRIBE, MAX_TOKENS_OCR, MODEL, RAW_DIR
+from config import (
+    ADAPTIVE_CONCURRENCY_THRESHOLD,
+    API_DELAY_SECONDS,
+    MAX_CONCURRENT_TRANSCRIBE,
+    MAX_TOKENS_OCR,
+    MODEL,
+    PACING_DELAY_SECONDS,
+    RAW_DIR,
+)
 
 logger = logging.getLogger("oral-history-tools")
 
@@ -36,6 +45,30 @@ MODE_HINTS = {
     "printed": "This is a PRINTED/TYPED document. Focus on accurate character recognition.",
     "mixed": "This document may contain BOTH handwritten and printed text. Handle each appropriately.",
 }
+
+
+def classify_error(exc):
+    """Classify an API exception into a reason code and user-friendly message.
+
+    Returns:
+        (error_code, error_message) tuple.
+    """
+    if isinstance(exc, anthropic.RateLimitError):
+        return "rate_limit", "API rate limit exceeded — too many requests in a short period"
+    if isinstance(exc, anthropic.APITimeoutError):
+        return "timeout", "API request timed out — the server took too long to respond"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "connection", "Could not connect to the API — check network connectivity"
+    if isinstance(exc, anthropic.APIStatusError):
+        code = exc.status_code
+        if code in (500, 502, 503, 529):
+            return "server_error", f"API server error (HTTP {code}) — temporary service issue"
+        if code == 401:
+            return "auth_error", "Invalid API key — check your ANTHROPIC_API_KEY"
+        if code == 400:
+            return "image_rejected", "API rejected the image — it may be too large or corrupted"
+        return "api_error", f"API error (HTTP {code}): {exc.message}"
+    return "unknown", f"Unexpected error: {exc}"
 
 
 def _checkpoint_basename(page_entry):
@@ -145,6 +178,7 @@ async def transcribe_page_async(page_entry, total_pages, mode="handwritten",
         "tokens_used": 0,
         "status": "error",
         "error_message": None,
+        "error_code": None,
     }
 
     mode_hint = MODE_HINTS.get(mode, MODE_HINTS["handwritten"])
@@ -157,7 +191,7 @@ async def transcribe_page_async(page_entry, total_pages, mode="handwritten",
         f"Source: {page_entry['source_file']}, page {page_entry['source_page']}."
     )
 
-    max_retries = 3
+    max_retries = 5
 
     async with semaphore:
         for attempt in range(max_retries + 1):
@@ -184,6 +218,7 @@ async def transcribe_page_async(page_entry, total_pages, mode="handwritten",
                 break
             except (anthropic.RateLimitError, anthropic.APIStatusError,
                     anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                error_code, error_msg = classify_error(e)
                 # Retry on transient errors: rate limits, 500/529, connection, timeout
                 is_permanent = (
                     isinstance(e, anthropic.APIStatusError)
@@ -191,23 +226,30 @@ async def transcribe_page_async(page_entry, total_pages, mode="handwritten",
                 )
                 if is_permanent:
                     logger.error("Non-retryable API error on page %d: %s", page_entry["sequence"], e)
-                    result["error_message"] = str(e)
+                    result["error_code"] = error_code
+                    result["error_message"] = error_msg
                     return result
                 if attempt < max_retries:
-                    delay = min(2 ** attempt * 2, 60)
+                    # Exponential backoff with jitter to avoid thundering herd
+                    base_delay = min(2 ** attempt * 2, 60)
+                    jitter = random.uniform(0, base_delay * 0.5)
+                    delay = base_delay + jitter
                     logger.warning(
-                        "Transient error on page %d (%s), backing off %ds (attempt %d/%d)",
-                        page_entry["sequence"], type(e).__name__, delay, attempt + 1, max_retries,
+                        "Transient error on page %d (%s), backing off %.1fs (attempt %d/%d)",
+                        page_entry["sequence"], error_code, delay, attempt + 1, max_retries,
                     )
                     await asyncio.sleep(delay)
                 else:
                     logger.error("Retries exhausted for page %d after %d attempts: %s",
                                  page_entry["sequence"], max_retries, e)
-                    result["error_message"] = f"Failed after {max_retries} retries: {e}"
+                    result["error_code"] = error_code
+                    result["error_message"] = f"{error_msg} (failed after {max_retries} retries)"
                     return result
             except Exception as e:
+                error_code, error_msg = classify_error(e)
                 logger.error("Unexpected error on page %d: %s", page_entry["sequence"], e)
-                result["error_message"] = str(e)
+                result["error_code"] = error_code
+                result["error_message"] = error_msg
                 return result
 
     text = response.content[0].text if response.content else ""
@@ -237,17 +279,28 @@ async def transcribe_batch_concurrent(prepared_pages, mode="handwritten",
     Args:
         prepared_pages: List of page dicts from prepare_batch().
         mode: "handwritten", "printed", or "mixed".
-        max_concurrent: Max concurrent API calls (default from config).
+        max_concurrent: Max concurrent API calls (default from config, adaptive for large batches).
         progress_callback: Optional callable(completed_count, total_pages, result)
             called after each page completes.
 
     Returns:
         List of enriched page_entry dicts in original order.
     """
-    max_concurrent = max_concurrent or MAX_CONCURRENT_TRANSCRIBE
+    total_pages = len(prepared_pages)
+
+    # Adaptive concurrency: go sequential for large batches to prevent rate limiting
+    if max_concurrent is None:
+        if total_pages > ADAPTIVE_CONCURRENCY_THRESHOLD:
+            max_concurrent = 1
+            logger.info(
+                "Large batch (%d pages > %d threshold): using sequential mode to prevent rate limits",
+                total_pages, ADAPTIVE_CONCURRENCY_THRESHOLD,
+            )
+        else:
+            max_concurrent = MAX_CONCURRENT_TRANSCRIBE
+
     client = anthropic.AsyncAnthropic()
     semaphore = asyncio.Semaphore(max_concurrent)
-    total_pages = len(prepared_pages)
 
     logger.info(
         "Starting concurrent transcription: %d pages, max_concurrent=%d",
@@ -261,6 +314,9 @@ async def transcribe_batch_concurrent(prepared_pages, mode="handwritten",
 
     async def process_page(index, page):
         nonlocal completed_count
+        # Pacing delay: stagger requests to avoid bursting the API
+        if index > 0 and PACING_DELAY_SECONDS > 0:
+            await asyncio.sleep(index * PACING_DELAY_SECONDS)
         result = await transcribe_page_async(page, total_pages, mode, client, semaphore)
         async with lock:
             results[index] = result

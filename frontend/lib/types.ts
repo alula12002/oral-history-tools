@@ -14,6 +14,8 @@ export interface PageResult {
   text: string | null;
   confidence: string | null;
   status: string | null;
+  error_code: string | null;
+  error_message: string | null;
 }
 
 export interface UploadResponse {

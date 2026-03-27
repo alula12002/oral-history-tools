@@ -51,6 +51,16 @@ export async function startRefinement(jobId: string): Promise<void> {
   }
 }
 
+export async function retryFailedPages(jobId: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/retry/${jobId}`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to retry pages");
+  }
+}
+
 export async function getJobStatus(jobId: string): Promise<StatusResponse> {
   const res = await fetch(`${API_URL}/api/status/${jobId}`);
   if (!res.ok) {

@@ -1,19 +1,40 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { StatusResponse } from "@/lib/types";
-import { triggerExport, getDownloadUrl } from "@/lib/api";
+import { triggerExport, getDownloadUrl, retryFailedPages, getJobStatus } from "@/lib/api";
 
 interface ResultsStepProps {
   jobId: string;
   status: StatusResponse;
 }
 
-export default function ResultsStep({ jobId, status }: ResultsStepProps) {
+const ERROR_LABELS: Record<string, string> = {
+  rate_limit: "Rate limited",
+  timeout: "Timed out",
+  connection: "Connection error",
+  server_error: "Server error",
+  auth_error: "Auth error",
+  image_rejected: "Image rejected",
+  api_error: "API error",
+  unknown: "Unknown error",
+};
+
+export default function ResultsStep({ jobId, status: initialStatus }: ResultsStepProps) {
+  const [status, setStatus] = useState(initialStatus);
   const [exporting, setExporting] = useState(false);
   const [exported, setExported] = useState(false);
   const [error, setError] = useState("");
   const [showFullText, setShowFullText] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clean up polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
+  }, []);
 
   const handleExport = useCallback(async () => {
     setExporting(true);
@@ -36,8 +57,36 @@ export default function ResultsStep({ jobId, status }: ResultsStepProps) {
     [jobId]
   );
 
+  const handleRetry = useCallback(async () => {
+    setRetrying(true);
+    setError("");
+    try {
+      await retryFailedPages(jobId);
+      // Poll until retry completes
+      const poll = async () => {
+        try {
+          const updated = await getJobStatus(jobId);
+          setStatus(updated);
+          if (updated.status === "processing") {
+            pollRef.current = setTimeout(poll, 2000);
+          } else {
+            setRetrying(false);
+          }
+        } catch {
+          setRetrying(false);
+          setError("Failed to check retry status");
+        }
+      };
+      pollRef.current = setTimeout(poll, 2000);
+    } catch (e) {
+      setRetrying(false);
+      setError(e instanceof Error ? e.message : "Retry failed");
+    }
+  }, [jobId]);
+
   const pageResults = status.page_results || [];
   const okPages = pageResults.filter((p) => p.status === "ok");
+  const failedPages = pageResults.filter((p) => p.status === "error");
   const refinedText = status.refined_text || "";
 
   // Preview: first 500 chars
@@ -82,6 +131,36 @@ export default function ResultsStep({ jobId, status }: ResultsStepProps) {
         </div>
       </div>
 
+      {/* Failed pages banner + retry */}
+      {failedPages.length > 0 && (
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-amber-800">
+                {failedPages.length} page{failedPages.length > 1 ? "s" : ""} failed
+              </p>
+              <p className="text-xs text-amber-600 mt-0.5">
+                {failedPages.map((p) => `Page ${p.sequence}`).join(", ")}
+              </p>
+            </div>
+            <button
+              onClick={handleRetry}
+              disabled={retrying}
+              className="px-3 py-1.5 bg-amber-600 text-white text-sm rounded font-medium hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {retrying ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Retrying...
+                </span>
+              ) : (
+                "Retry failed pages"
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Per-page confidence breakdown */}
       <details className="mb-4">
         <summary className="text-sm font-medium text-gray-700 cursor-pointer hover:text-gray-900">
@@ -100,14 +179,23 @@ export default function ResultsStep({ jobId, status }: ResultsStepProps) {
                   {pr.source_page > 1 ? `, p${pr.source_page}` : ""})
                 </span>
               </span>
-              <span
-                className={
-                  pr.status === "ok"
-                    ? "text-green-600 font-medium"
-                    : "text-yellow-600"
-                }
-              >
-                {pr.confidence || pr.status}
+              <span className="flex items-center gap-2">
+                {pr.status === "error" && pr.error_message && (
+                  <span className="text-xs text-gray-400" title={pr.error_message}>
+                    {ERROR_LABELS[pr.error_code || ""] || pr.error_code || ""}
+                  </span>
+                )}
+                <span
+                  className={
+                    pr.status === "ok"
+                      ? "text-green-600 font-medium"
+                      : pr.status === "error"
+                      ? "text-red-500 font-medium"
+                      : "text-yellow-600"
+                  }
+                >
+                  {pr.status === "error" ? "error" : pr.confidence || pr.status}
+                </span>
               </span>
             </div>
           ))}

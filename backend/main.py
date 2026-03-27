@@ -184,6 +184,8 @@ def _run_transcribe(job_id: str):
                     text=r.get("text"),
                     confidence=r.get("confidence"),
                     status=r.get("status"),
+                    error_code=r.get("error_code"),
+                    error_message=r.get("error_message"),
                 )
                 for r in all_results if r is not None
             ]
@@ -230,6 +232,123 @@ def start_transcribe(job_id: str):
     thread.start()
 
     return {"job_id": job_id, "status": "processing", "message": "Transcription started"}
+
+
+# --- Retry Failed Pages ---
+
+def _run_retry(job_id: str):
+    """Background thread: re-transcribe only failed pages."""
+    import asyncio
+
+    from ocr.scanner import prepare_batch
+    from ocr.transcriber import transcribe_batch_concurrent
+
+    try:
+        job = job_store.get(job_id)
+        job_dir = UPLOAD_DIR / job_id
+
+        # Get existing results
+        results = _raw_results.get(job_id)
+        if not results:
+            from backend.jobs import load_job_cache
+            cached = load_job_cache(job_id)
+            if cached and cached["raw_results"]:
+                results = cached["raw_results"]
+        if not results:
+            job_store.update(job_id, status=JobStatus.failed, error="No previous results to retry from")
+            return
+
+        # Find failed page sequences
+        failed_sequences = {
+            r["sequence"] for r in results if r and r.get("status") == "error"
+        }
+        if not failed_sequences:
+            job_store.update(job_id, status=JobStatus.completed, step="transcribe", progress=1.0)
+            return
+
+        # Re-prepare batch (re-extract images from uploaded files)
+        full_batch = prepare_batch(str(job_dir), sort_by="name")
+        retry_batch = [p for p in full_batch if p["sequence"] in failed_sequences]
+
+        if not retry_batch:
+            job_store.update(job_id, status=JobStatus.failed, error="Could not re-extract failed pages")
+            return
+
+        total_retries = len(retry_batch)
+        logger.info("Retrying %d failed pages for job %s", total_retries, job_id)
+
+        retried_count = [0]
+
+        def on_retry_done(completed_count, total, result):
+            retried_count[0] = completed_count
+            # Merge result back into full results list
+            idx = result["sequence"] - 1
+            results[idx] = result
+
+            # Rebuild page_results
+            page_results = [
+                PageResult(
+                    sequence=r["sequence"],
+                    source_file=r["source_file"],
+                    source_page=r["source_page"],
+                    text=r.get("text"),
+                    confidence=r.get("confidence"),
+                    status=r.get("status"),
+                    error_code=r.get("error_code"),
+                    error_message=r.get("error_message"),
+                )
+                for r in results if r is not None
+            ]
+            job_store.update(
+                job_id,
+                progress=completed_count / total,
+                page_results=page_results,
+            )
+
+        # Use sequential mode for retries (conservative — we already failed once)
+        retry_results = asyncio.run(
+            transcribe_batch_concurrent(
+                retry_batch,
+                mode=job.mode,
+                max_concurrent=1,
+                progress_callback=on_retry_done,
+            )
+        )
+
+        # Update raw results and cache
+        _raw_results[job_id] = results
+        ok_count = sum(1 for r in results if r and r.get("status") == "ok")
+        total_tokens = sum(r.get("tokens_used", 0) for r in results if r)
+
+        job = job_store.update(
+            job_id,
+            status=JobStatus.completed,
+            step="transcribe",
+            progress=1.0,
+            transcription_tokens=total_tokens,
+        )
+        save_job_cache(job_id, job, raw_results=results)
+
+        recovered = sum(1 for r in retry_results if r and r.get("status") == "ok")
+        logger.info("Retry complete: %d/%d pages recovered", recovered, total_retries)
+
+    except Exception as e:
+        job_store.update(job_id, status=JobStatus.failed, error=str(e))
+
+
+@app.post("/api/retry/{job_id}")
+def retry_failed_pages(job_id: str):
+    job = _get_job_or_404(job_id)
+
+    if job.status == JobStatus.processing:
+        raise HTTPException(status_code=409, detail="Job is already processing")
+
+    job_store.update(job_id, status=JobStatus.processing, step="transcribe", progress=0.0, error=None)
+
+    thread = threading.Thread(target=_run_retry, args=(job_id,), daemon=True)
+    thread.start()
+
+    return {"job_id": job_id, "status": "processing", "message": "Retrying failed pages"}
 
 
 # --- Refine ---
